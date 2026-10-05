@@ -1,0 +1,6 @@
+# Install the CPU-only torch build first (this machine has no NVIDIA GPU):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+ultralytics
+opencv-python
