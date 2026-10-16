@@ -1,18 +1,12 @@
-"""Real-time bird detection from a laptop webcam using YOLOv8.
+"""Real-time bird detection with YOLOv8 and ESP32 USB Serial control.
 
-Runs the COCO-pretrained YOLOv8 model and keeps only the "bird" class (id 14),
-so everything else in frame is ignored.
+Sends BLINK once when a bird appears, and DONT_BLINK once after no bird
+has been detected for BIRD_LOST_SECONDS. It does not send a command every frame.
 
-CPU inference is slower than the camera, so three stages run concurrently: a
-capture thread keeps only the newest frame, a detector thread chews on whichever
-frame is newest whenever it is free, and the main thread draws the most recent
-boxes over the live feed. The preview therefore stays smooth at camera framerate
-while the boxes refresh at whatever rate the CPU manages.
-
-Keys while the window is focused:
+Keys:
     q / Esc   quit
     s         save the current frame to captures/
-    c         cycle the confidence threshold (0.25 / 0.40 / 0.55)
+    c         cycle confidence threshold (0.25 / 0.40 / 0.55)
 """
 
 import argparse
@@ -25,17 +19,22 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import serial
 from ultralytics import YOLO
 
-BIRD_CLASS_ID = 14  # "bird" in the COCO dataset
+BIRD_CLASS_ID = 14
 CONF_STEPS = (0.25, 0.40, 0.55)
-BOX_COLOR = (0, 215, 255)  # BGR: amber
+BOX_COLOR = (0, 215, 255)
 TEXT_COLOR = (20, 20, 20)
-STALE_AFTER = 1.0  # seconds before boxes are considered too old to draw
+STALE_AFTER = 1.0
+
+ESP32_PORT = "COM7"
+ESP32_BAUD = 115200
+BIRD_LOST_SECONDS = 1.5  # Avoid stopping on a single missed inference
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Real-time bird detection via webcam.")
+    p = argparse.ArgumentParser(description="YOLOv8 bird detection with ESP32 LED control.")
     p.add_argument("--camera", type=int, default=0,
                    help="Webcam index (0 is usually the built-in camera).")
     p.add_argument("--model", default="yolov8n.pt",
@@ -48,11 +47,15 @@ def parse_args():
     p.add_argument("--height", type=int, default=720, help="Requested capture height.")
     p.add_argument("--no-mirror", action="store_true",
                    help="Do not flip the preview horizontally.")
+    p.add_argument("--no-esp32", action="store_true",
+                   help="Run YOLO without connecting to the ESP32.")
+    p.add_argument("--esp32-port", default=ESP32_PORT,
+                   help="ESP32 serial port (default: COM7).")
     return p.parse_args()
 
 
 def open_camera(index, width, height):
-    """Open the webcam, preferring DirectShow on Windows for a fast startup."""
+    """Open the webcam, preferring DirectShow on Windows."""
     backends = ([cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
                 if sys.platform == "win32" else [cv2.CAP_ANY])
     for backend in backends:
@@ -60,18 +63,14 @@ def open_camera(index, width, height):
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency low
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             return cap
         cap.release()
     return None
 
 
 class LatestFrame:
-    """A one-slot mailbox: writers overwrite, readers take the newest frame.
-
-    Dropping stale frames is what keeps latency flat - a queue would let the
-    slow consumer fall further behind the camera with every frame.
-    """
+    """One-slot mailbox that keeps the newest camera frame."""
 
     def __init__(self):
         self._frame = None
@@ -84,7 +83,6 @@ class LatestFrame:
         self._new.set()
 
     def get(self, timeout=None):
-        """Block until a fresh frame arrives, then return it (None on timeout)."""
         if not self._new.wait(timeout):
             return None
         with self._lock:
@@ -92,7 +90,6 @@ class LatestFrame:
             return self._frame
 
     def peek(self):
-        """Return the current frame without waiting, fresh or not."""
         with self._lock:
             return self._frame
 
@@ -104,12 +101,12 @@ def capture_loop(cap, mailbox, mirror, stop):
             stop.set()
             break
         if mirror:
-            frame = cv2.flip(frame, 1)  # mirror so the preview feels natural
+            frame = cv2.flip(frame, 1)
         mailbox.put(frame)
 
 
 class Detector(threading.Thread):
-    """Detects birds on the newest available frame, in a loop, until stopped."""
+    """Detect birds on the newest available frame until stopped."""
 
     def __init__(self, model, mailbox, imgsz, conf, stop):
         super().__init__(daemon=True)
@@ -118,16 +115,15 @@ class Detector(threading.Thread):
         self.imgsz = imgsz
         self.conf = conf
         self.stop_event = stop
-        self.boxes = []  # (x1, y1, x2, y2, confidence) tuples
+        self.boxes = []
         self.updated_at = 0.0
         self.infer_times = deque(maxlen=15)
         self._lock = threading.Lock()
 
     def snapshot(self):
-        """Return (boxes, timestamp, detections-per-second) for the drawing thread."""
         with self._lock:
-            fps = (len(self.infer_times) / sum(self.infer_times)
-                   if self.infer_times else 0.0)
+            total = sum(self.infer_times)
+            fps = len(self.infer_times) / total if total > 0 else 0.0
             return list(self.boxes), self.updated_at, fps
 
     def run(self):
@@ -141,15 +137,18 @@ class Detector(threading.Thread):
                     frame,
                     imgsz=self.imgsz,
                     conf=self.conf,
-                    classes=[BIRD_CLASS_ID],  # YOLO discards every other class
+                    classes=[BIRD_CLASS_ID],
                     verbose=False,
                 )[0]
-            except Exception as exc:  # keep the preview alive if one frame upsets the model
+            except Exception as exc:
                 print(f"Detection failed: {exc}")
                 continue
+
             elapsed = time.perf_counter() - start
-            found = [(*(int(v) for v in b.xyxy[0]), float(b.conf[0]))
-                     for b in result.boxes]
+            found = [
+                (*(int(v) for v in box.xyxy[0]), float(box.conf[0]))
+                for box in result.boxes
+            ]
             with self._lock:
                 self.boxes = found
                 self.updated_at = time.time()
@@ -157,7 +156,6 @@ class Detector(threading.Thread):
 
 
 def draw_label(frame, text, x, y):
-    """Draw text on a filled background so it stays readable over any scene."""
     (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
     top = max(y - th - base - 4, 0)
     cv2.rectangle(frame, (x, top), (x + tw + 8, top + th + base + 4), BOX_COLOR, -1)
@@ -165,73 +163,137 @@ def draw_label(frame, text, x, y):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_COLOR, 2, cv2.LINE_AA)
 
 
-def draw_hud(frame, view_fps, det_fps, count, conf):
+def draw_hud(frame, view_fps, det_fps, count, conf, esp_status, bird_status):
     h, w = frame.shape[:2]
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, h - 38), (w, h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-    status = (f"view {view_fps:4.1f} fps | detect {det_fps:4.1f} fps | "
-              f"birds: {count} | conf: {conf:.2f} | [q]uit [s]ave [c]onf")
+    status = (
+        f"view {view_fps:4.1f} fps | detect {det_fps:4.1f} fps | "
+        f"birds: {count} | conf: {conf:.2f} | bird: {bird_status} | "
+        f"ESP32: {esp_status} | [q]uit [s]ave [c]onf"
+    )
     cv2.putText(frame, status, (10, h - 13),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def send_command(esp32, command):
+    """Send a single state-change command; return True on success."""
+    if esp32 is None or not esp32.is_open:
+        return False
+    try:
+        esp32.write((command + "\n").encode("ascii"))
+        esp32.flush()
+        print(f"Sent {command} to ESP32.")
+        return True
+    except serial.SerialException as exc:
+        print(f"ESP32 communication failed while sending {command}: {exc}")
+        return False
 
 
 def main():
     args = parse_args()
 
-    print(f"Loading {args.model} ...")
-    model = YOLO(args.model)  # downloads the weights once, then caches them
-    # The first inference allocates buffers and runs ~40x slower than the rest;
-    # pay that cost here rather than on the first live frame.
-    model.predict(np.zeros((args.height, args.width, 3), np.uint8),
-                  imgsz=args.imgsz, classes=[BIRD_CLASS_ID], verbose=False)
+    esp32 = None
+    if not args.no_esp32:
+        try:
+            esp32 = serial.Serial(args.esp32_port, ESP32_BAUD, timeout=1)
+            time.sleep(2)  # Opening the serial port can reset the ESP32.
+            print(f"Connected to ESP32 on {args.esp32_port}")
+        except serial.SerialException as exc:
+            print(f"Could not connect to ESP32: {exc}")
+            print("YOLO will continue without ESP32 triggering.")
+    else:
+        print("ESP32 connection disabled by --no-esp32.")
 
-    cap = open_camera(args.camera, args.width, args.height)
-    if cap is None:
-        sys.exit(f"Could not open camera {args.camera}. "
-                 "Close other apps using it, or try --camera 1.")
-
-    captures_dir = Path(__file__).parent / "captures"
-    conf_idx = min(range(len(CONF_STEPS)), key=lambda i: abs(CONF_STEPS[i] - args.conf))
-    conf = args.conf
-
+    cap = None
     stop = threading.Event()
-    mailbox = LatestFrame()
-    grabber = threading.Thread(target=capture_loop,
-                               args=(cap, mailbox, not args.no_mirror, stop),
-                               daemon=True)
-    detector = Detector(model, mailbox, args.imgsz, conf, stop)
-    grabber.start()
-    detector.start()
-
-    window = "Bird Detector - YOLOv8"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    view_times = deque(maxlen=30)
-    last_shown = time.perf_counter()
-
-    print("Running. Press 'q' in the window to quit.")
+    grabber = None
+    detector = None
+    bird_command_active = False
     try:
+        print("Loading YOLO model...")
+        model = YOLO(args.model)
+        model.predict(
+            np.zeros((args.height, args.width, 3), dtype=np.uint8),
+            imgsz=args.imgsz,
+            classes=[BIRD_CLASS_ID],
+            verbose=False,
+        )
+
+        cap = open_camera(args.camera, args.width, args.height)
+        if cap is None:
+            sys.exit(
+                f"Could not open camera {args.camera}. Close other apps using it, "
+                "or try --camera 1."
+            )
+
+        captures_dir = Path(__file__).parent / "captures"
+        conf_idx = min(range(len(CONF_STEPS)), key=lambda i: abs(CONF_STEPS[i] - args.conf))
+        conf = args.conf
+
+        mailbox = LatestFrame()
+        grabber = threading.Thread(
+            target=capture_loop,
+            args=(cap, mailbox, not args.no_mirror, stop),
+            daemon=True,
+        )
+        detector = Detector(model, mailbox, args.imgsz, conf, stop)
+        grabber.start()
+        detector.start()
+
+        window = "Bird Detector - YOLOv8"
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        view_times = deque(maxlen=30)
+        last_shown = time.perf_counter()
+
+        last_bird_seen = 0.0
+        bird_status = "not detected"
+        esp_status = "connected" if esp32 and esp32.is_open else "offline"
+
+        print("Running. Press 'q' or Esc in the window to quit.")
         while not stop.is_set():
             frame = mailbox.peek()
-            if frame is None:  # camera has not delivered anything yet
+            if frame is None:
                 if cv2.waitKey(10) & 0xFF == 27:
                     break
                 continue
-            frame = frame.copy()  # the capture thread may swap the buffer under us
+            frame = frame.copy()
 
             boxes, updated_at, det_fps = detector.snapshot()
-            fresh = time.time() - updated_at < STALE_AFTER
+            now = time.time()
+            fresh = updated_at > 0 and (now - updated_at) < STALE_AFTER
+            bird_detected = fresh and len(boxes) > 0
+
+            if bird_detected:
+                last_bird_seen = now
+                if not bird_command_active:
+                    if send_command(esp32, "BLINK"):
+                        esp_status = "connected"
+                    bird_command_active = True
+                    bird_status = "detected"
+            elif bird_command_active and (now - last_bird_seen >= BIRD_LOST_SECONDS):
+                # Send DONT_BLINK only once when the bird-presence state changes.
+                if send_command(esp32, "DONT_BLINK"):
+                    esp_status = "connected"
+                bird_command_active = False
+                bird_status = "not detected"
+
             if fresh:
                 for x1, y1, x2, y2, score in boxes:
+                    x1, y1 = max(0, x1), max(0, y1)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, 2)
                     draw_label(frame, f"bird {score:.2f}", x1, y1)
 
-            now = time.perf_counter()
-            view_times.append(now - last_shown)
-            last_shown = now
+            now_perf = time.perf_counter()
+            view_times.append(now_perf - last_shown)
+            last_shown = now_perf
             elapsed = sum(view_times)
             view_fps = len(view_times) / elapsed if elapsed else 0.0
-            draw_hud(frame, view_fps, det_fps, len(boxes) if fresh else 0, conf)
+            draw_hud(
+                frame, view_fps, det_fps, len(boxes) if fresh else 0,
+                conf, esp_status, bird_status
+            )
             cv2.imshow(window, frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -240,25 +302,34 @@ def main():
             if key == ord("s"):
                 captures_dir.mkdir(exist_ok=True)
                 name = datetime.now().strftime("bird_%Y%m%d_%H%M%S_%f.jpg")
-                cv2.imwrite(str(captures_dir / name), frame)
-                print(f"Saved {captures_dir / name}")
+                path = captures_dir / name
+                cv2.imwrite(str(path), frame)
+                print(f"Saved {path}")
             if key == ord("c"):
                 conf_idx = (conf_idx + 1) % len(CONF_STEPS)
                 conf = CONF_STEPS[conf_idx]
                 detector.conf = conf
                 print(f"Confidence threshold -> {conf:.2f}")
 
-            # The window manager reports 0 once the user clicks the X button.
             if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                 break
+
     except KeyboardInterrupt:
         pass
     finally:
+        # Ensure LED is switched off when the Python app exits.
+        if bird_command_active:
+            send_command(esp32, "DONT_BLINK")
         stop.set()
-        grabber.join(timeout=2)
-        detector.join(timeout=2)
-        cap.release()
+        if grabber is not None:
+            grabber.join(timeout=2)
+        if detector is not None:
+            detector.join(timeout=2)
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
+        if esp32 is not None and esp32.is_open:
+            esp32.close()
 
 
 if __name__ == "__main__":
